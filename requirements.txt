@@ -1,0 +1,7 @@
+aiogram>=3.4,<4
+aioimaplib>=1.0.1
+aiosqlite>=0.20
+cryptography>=42
+httpx>=0.27
+python-dotenv>=1.0
+sievelib>=1.4
