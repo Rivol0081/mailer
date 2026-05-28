@@ -39,10 +39,22 @@ class _ProxiedIMAP4SSL(aioimaplib.IMAP4_SSL):
         self._proxy = proxy
         super().__init__(host=host, port=port, ssl_context=ssl_context, timeout=timeout)
 
-    def create_client(self, host, port, loop, conn_lost_cb=None, ssl_context=None):
+    def create_client(self, host, port, loop=None, conn_lost_cb=None, ssl_context=None):
         if self._proxy is None:
             return super().create_client(host, port, loop, conn_lost_cb, ssl_context)
-        # Mirror upstream: build protocol now, defer the connect as a task.
+        # Resolve the loop ourselves: in some aioimaplib versions the `loop`
+        # parameter arrives as None, and we still need something to schedule
+        # the proxy-connect task on.
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+        # ssl_context may also arrive as None depending on caller path; fall
+        # back to the one stored on the instance, then to a default context.
+        if ssl_context is None:
+            ssl_context = getattr(self, "ssl_context", None) or ssl_mod.create_default_context()
+
         self.protocol = aioimaplib.IMAP4ClientProtocol(loop, conn_lost_cb)
 
         async def _connect():

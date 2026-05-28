@@ -805,6 +805,22 @@ async def cb_proxyclr(call: CallbackQuery, storage: Storage, rotator: ProxyRotat
         pass
 
 
+async def _test_one_proxy(acc: Account, password: str, cfg) -> tuple[bool, str]:
+    try:
+        async with asyncio.timeout(25):
+            async with imap_client.imap_session(
+                acc.imap_host, acc.imap_port, acc.imap_ssl,
+                acc.email, password, proxy=cfg,
+            ):
+                return True, ""
+    except asyncio.TimeoutError:
+        return False, "timeout (25s)"
+    except PermissionError as e:
+        return False, "auth: " + str(e)[:80]
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:80]}"
+
+
 @router.callback_query(F.data.startswith("proxytest:"))
 async def cb_proxytest(call: CallbackQuery, storage: Storage, cipher: CredCipher):
     acc_id = int(call.data.split(":", 1)[1])
@@ -825,14 +841,12 @@ async def cb_proxytest(call: CallbackQuery, storage: Storage, cipher: CredCipher
     password = cipher.decrypt(acc.password_enc)
     results: list[str] = []
     for i, cfg in enumerate(cfgs, 1):
-        try:
-            ok = await imap_client.check_credentials(
-                acc.imap_host, acc.imap_port, acc.imap_ssl,
-                acc.email, password, proxy=cfg,
-            )
-            results.append(f"{i}. {'✅' if ok else '❌'} {h(cfg.short)}")
-        except Exception as e:
-            results.append(f"{i}. ❌ {h(cfg.short)} — {h(str(e)[:60])}")
+        ok, err = await _test_one_proxy(acc, password, cfg)
+        mark = "✅" if ok else "❌"
+        line = f"{i}. {mark} {h(cfg.short)}"
+        if not ok and err:
+            line += f"\n   <code>{h(err)}</code>"
+        results.append(line)
     await call.message.answer("\n".join(results[:30]))
 
 
