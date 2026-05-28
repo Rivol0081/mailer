@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     sieve_port    INTEGER NOT NULL DEFAULT 4190,
     filter_on     INTEGER NOT NULL DEFAULT 0,
     filter_action TEXT NOT NULL DEFAULT 'trash',  -- trash | delete | flag
+    proxies     TEXT,
     UNIQUE(tg_user_id, email)
 );
 
@@ -56,6 +57,7 @@ class Account:
     sieve_port: int
     filter_on: bool
     filter_action: str
+    proxies: str | None = None
 
 
 def _row_to_account(row) -> Account:
@@ -72,6 +74,7 @@ def _row_to_account(row) -> Account:
         sieve_port=row[9],
         filter_on=bool(row[10]),
         filter_action=row[11],
+        proxies=row[12] if len(row) > 12 else None,
     )
 
 
@@ -82,6 +85,19 @@ class Storage:
     async def init(self) -> None:
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(SCHEMA)
+            # Migration: add proxies column if upgrading from older schema.
+            cur = await db.execute("PRAGMA table_info(accounts)")
+            cols = {r[1] for r in await cur.fetchall()}
+            if "proxies" not in cols:
+                await db.execute("ALTER TABLE accounts ADD COLUMN proxies TEXT")
+            await db.commit()
+
+    async def set_proxies(self, account_id: int, proxies: str | None) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE accounts SET proxies = ? WHERE id = ?",
+                (proxies, account_id),
+            )
             await db.commit()
 
     async def add_account(

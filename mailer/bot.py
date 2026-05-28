@@ -23,10 +23,11 @@ from aiogram.types import (
     TelegramObject,
 )
 
-from . import autoconfig, filters as filt, imap_client, sieve_client
+from . import autoconfig, filters as filt, imap_client, proxy as proxymod, sieve_client
 from .config import load_settings
 from .crypto import CredCipher
 from .filters import FilterDaemon
+from .proxy_pool import ProxyRotator
 from .storage import Account, Storage
 
 
@@ -92,6 +93,10 @@ class KeywordInput(StatesGroup):
     waiting_keyword = State()
 
 
+class ProxyInput(StatesGroup):
+    waiting_proxy = State()
+
+
 # ---------- Keyboards ----------
 
 def main_menu_kb(has_active: bool) -> ReplyKeyboardMarkup:
@@ -120,13 +125,15 @@ def accounts_kb(accounts: list[Account], active_id: int | None) -> InlineKeyboar
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def account_actions_kb(acc: Account) -> InlineKeyboardMarkup:
+def account_actions_kb(acc: Account, proxy_count: int = 0) -> InlineKeyboardMarkup:
     toggle = "🔴 Выключить фильтр" if acc.filter_on else "🟢 Включить фильтр"
+    proxy_label = f"🌐 Прокси: {proxy_count}" if proxy_count else "🌐 Прокси: нет"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=toggle, callback_data=f"toggle:{acc.id}")],
         [InlineKeyboardButton(text="➕ Ключевое слово", callback_data=f"kwadd:{acc.id}")],
         [InlineKeyboardButton(text="📋 Список слов", callback_data=f"kwlist:{acc.id}")],
         [InlineKeyboardButton(text=f"⚙️ Действие: {acc.filter_action}", callback_data=f"action:{acc.id}")],
+        [InlineKeyboardButton(text=proxy_label, callback_data=f"proxy:{acc.id}")],
         [InlineKeyboardButton(text="📁 Папки", callback_data=f"folders:{acc.id}")],
         [InlineKeyboardButton(text="📨 Последние письма", callback_data=f"mails:{acc.id}:INBOX")],
         [InlineKeyboardButton(text="🔌 Проверить доступность", callback_data=f"ping:{acc.id}")],
@@ -156,7 +163,8 @@ HELP = (
     "• Проверять доступность IMAP\n"
     "• Включать/выключать фильтр удаления входящих по словам\n"
     "• Действия фильтра: <code>trash</code> (в корзину) / <code>delete</code> (без следа) / <code>flag</code> (пометить)\n"
-    "• Полная очистка всех писем во всех папках\n\n"
+    "• Полная очистка всех писем во всех папках\n"
+    "• Пул прокси (http/https/socks5) с чередованием по кругу — снижает риск лимитов\n\n"
     "<b>Чего IMAP не умеет</b>:\n"
     "• Удалить сам аккаунт у провайдера — только через сайт провайдера\n"
     "• Сменить пароль — тоже только через веб\n\n"
@@ -330,13 +338,14 @@ async def cb_select(call: CallbackQuery, storage: Storage):
 
 
 @router.callback_query(F.data.startswith("forget:"))
-async def cb_forget(call: CallbackQuery, storage: Storage, cipher: CredCipher):
+async def cb_forget(call: CallbackQuery, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     acc_id = int(call.data.split(":", 1)[1])
     acc = await storage.get_account(acc_id)
     if not acc or acc.tg_user_id != call.from_user.id:
         await call.answer("Не найден", show_alert=True)
         return
-    await filt.remove_sieve_safe(acc, cipher)
+    await filt.remove_sieve_safe(acc, cipher, rotator=rotator)
+    rotator.reset(acc_id)
     await storage.delete_account(acc_id)
     await call.answer("Ящик забыт")
     accounts = await storage.list_accounts(call.from_user.id)
@@ -352,7 +361,7 @@ async def cb_forget(call: CallbackQuery, storage: Storage, cipher: CredCipher):
 
 @router.message(F.text == "🎛 Активный ящик")
 @router.message(F.text == "🧪 Фильтры")
-async def active_account(msg: Message, storage: Storage):
+async def active_account(msg: Message, storage: Storage, rotator: ProxyRotator):
     acc = await storage.get_active(msg.from_user.id)
     if not acc:
         await msg.answer("Нет активного ящика. Выбери в 📂 Мои ящики.")
@@ -360,24 +369,27 @@ async def active_account(msg: Message, storage: Storage):
     keywords = await storage.list_keywords(acc.id)
     flt_state = "🟢 включён" if acc.filter_on else "🔴 выключен"
     sieve_info = "Sieve" if acc.sieve_host else "клиентский цикл"
+    proxy_count = rotator.count_for(acc)
+    proxy_info = f"{proxy_count} (чередуются)" if proxy_count else "не используются"
     text = (
         f"<b>{h(acc.label)}</b> — <code>{h(acc.email)}</code>\n"
         f"IMAP: <code>{h(acc.imap_host)}:{acc.imap_port}</code>\n"
         f"Режим фильтра: {sieve_info}\n"
         f"Фильтр: {flt_state} (действие: <code>{acc.filter_action}</code>)\n"
+        f"Прокси: {proxy_info}\n"
         f"Ключевых слов: <b>{len(keywords)}</b>"
     )
     if keywords:
         text += "\n\n• " + "\n• ".join(h(k) for k in keywords[:30])
         if len(keywords) > 30:
             text += f"\n…и ещё {len(keywords) - 30}"
-    await msg.answer(text, reply_markup=account_actions_kb(acc))
+    await msg.answer(text, reply_markup=account_actions_kb(acc, proxy_count=proxy_count))
 
 
 # ----- Filter ops -----
 
 @router.callback_query(F.data.startswith("toggle:"))
-async def cb_toggle(call: CallbackQuery, storage: Storage, cipher: CredCipher):
+async def cb_toggle(call: CallbackQuery, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     acc_id = int(call.data.split(":", 1)[1])
     acc = await storage.get_account(acc_id)
     if not acc or acc.tg_user_id != call.from_user.id:
@@ -389,21 +401,23 @@ async def cb_toggle(call: CallbackQuery, storage: Storage, cipher: CredCipher):
         await call.answer("Сначала добавь хоть одно ключевое слово.", show_alert=True)
         return
     if new_state:
-        mode, err = await filt.install_or_skip_sieve(acc, cipher, keywords)
+        mode, err = await filt.install_or_skip_sieve(acc, cipher, keywords, rotator=rotator)
         await storage.set_filter_state(acc.id, True)
         await call.answer(
             f"Фильтр включён ({mode})" + (f". Sieve: {err[:50]}" if err else "")
         )
     else:
-        await filt.remove_sieve_safe(acc, cipher)
+        await filt.remove_sieve_safe(acc, cipher, rotator=rotator)
         await storage.set_filter_state(acc.id, False)
         await call.answer("Фильтр выключен")
     acc = await storage.get_account(acc_id)
-    await call.message.edit_reply_markup(reply_markup=account_actions_kb(acc))
+    await call.message.edit_reply_markup(
+        reply_markup=account_actions_kb(acc, proxy_count=rotator.count_for(acc))
+    )
 
 
 @router.callback_query(F.data.startswith("action:"))
-async def cb_action(call: CallbackQuery, storage: Storage, cipher: CredCipher):
+async def cb_action(call: CallbackQuery, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     acc_id = int(call.data.split(":", 1)[1])
     acc = await storage.get_account(acc_id)
     if not acc or acc.tg_user_id != call.from_user.id:
@@ -416,10 +430,12 @@ async def cb_action(call: CallbackQuery, storage: Storage, cipher: CredCipher):
     if acc.filter_on:
         keywords = await storage.list_keywords(acc.id)
         acc = await storage.get_account(acc_id)
-        await filt.install_or_skip_sieve(acc, cipher, keywords)
+        await filt.install_or_skip_sieve(acc, cipher, keywords, rotator=rotator)
     acc = await storage.get_account(acc_id)
     await call.answer(f"Действие: {new_action}")
-    await call.message.edit_reply_markup(reply_markup=account_actions_kb(acc))
+    await call.message.edit_reply_markup(
+        reply_markup=account_actions_kb(acc, proxy_count=rotator.count_for(acc))
+    )
 
 
 @router.callback_query(F.data.startswith("kwadd:"))
@@ -434,7 +450,7 @@ async def cb_kwadd(call: CallbackQuery, state: FSMContext):
 
 
 @router.message(KeywordInput.waiting_keyword)
-async def kw_input(msg: Message, state: FSMContext, storage: Storage, cipher: CredCipher):
+async def kw_input(msg: Message, state: FSMContext, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     data = await state.get_data()
     acc_id = int(data["account_id"])
     kw = (msg.text or "").strip()
@@ -446,7 +462,7 @@ async def kw_input(msg: Message, state: FSMContext, storage: Storage, cipher: Cr
     acc = await storage.get_account(acc_id)
     if acc and acc.filter_on:
         keywords = await storage.list_keywords(acc.id)
-        await filt.install_or_skip_sieve(acc, cipher, keywords)
+        await filt.install_or_skip_sieve(acc, cipher, keywords, rotator=rotator)
     await msg.answer(
         f"Добавил: <code>{h(kw)}</code>",
         reply_markup=main_menu_kb(has_active=True),
@@ -474,7 +490,7 @@ async def cb_kwlist(call: CallbackQuery, storage: Storage):
 
 
 @router.callback_query(F.data.startswith("kwrm:"))
-async def cb_kwrm(call: CallbackQuery, storage: Storage, cipher: CredCipher):
+async def cb_kwrm(call: CallbackQuery, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     _, acc_id_s, idx_s = call.data.split(":")
     acc_id = int(acc_id_s)
     idx = int(idx_s)
@@ -488,7 +504,7 @@ async def cb_kwrm(call: CallbackQuery, storage: Storage, cipher: CredCipher):
         await storage.remove_keyword(acc.id, kw)
         if acc.filter_on:
             new_kws = await storage.list_keywords(acc.id)
-            await filt.install_or_skip_sieve(acc, cipher, new_kws)
+            await filt.install_or_skip_sieve(acc, cipher, new_kws, rotator=rotator)
         await call.answer(f"Удалил: {kw}")
         await call.message.edit_text("Слово удалено.")
     else:
@@ -508,7 +524,7 @@ async def cb_wipe(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("wipe!:"))
-async def cb_wipe_confirm(call: CallbackQuery, storage: Storage, cipher: CredCipher):
+async def cb_wipe_confirm(call: CallbackQuery, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     acc_id = int(call.data.split(":", 1)[1])
     acc = await storage.get_account(acc_id)
     if not acc or acc.tg_user_id != call.from_user.id:
@@ -518,7 +534,8 @@ async def cb_wipe_confirm(call: CallbackQuery, storage: Storage, cipher: CredCip
     password = cipher.decrypt(acc.password_enc)
     try:
         async with imap_client.imap_session(
-            acc.imap_host, acc.imap_port, acc.imap_ssl, acc.email, password
+            acc.imap_host, acc.imap_port, acc.imap_ssl, acc.email, password,
+            proxy=rotator.next_for(acc),
         ) as client:
             report = await imap_client.wipe_all(client)
     except Exception as e:
@@ -559,11 +576,12 @@ async def cb_cancel(call: CallbackQuery):
 
 # ----- Connectivity check, folders, mails -----
 
-async def _check_account(acc: Account, cipher: CredCipher) -> str:
+async def _check_account(acc: Account, cipher: CredCipher, rotator: ProxyRotator) -> str:
     password = cipher.decrypt(acc.password_enc)
     try:
         async with imap_client.imap_session(
-            acc.imap_host, acc.imap_port, acc.imap_ssl, acc.email, password
+            acc.imap_host, acc.imap_port, acc.imap_ssl, acc.email, password,
+            proxy=rotator.next_for(acc),
         ) as client:
             total, unseen = await imap_client.folder_stats(client, "INBOX")
             return (
@@ -579,30 +597,30 @@ async def _check_account(acc: Account, cipher: CredCipher) -> str:
 
 @router.message(F.text == "🔌 Проверить доступность")
 @router.message(Command("check"))
-async def cmd_check(msg: Message, storage: Storage, cipher: CredCipher):
+async def cmd_check(msg: Message, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     accounts = await storage.list_accounts(msg.from_user.id)
     if not accounts:
         await msg.answer("Нет добавленных ящиков.")
         return
     note = await msg.answer("Проверяю все ящики…")
-    results = await asyncio.gather(*(_check_account(a, cipher) for a in accounts))
+    results = await asyncio.gather(*(_check_account(a, cipher, rotator) for a in accounts))
     await note.edit_text("\n\n".join(results))
 
 
 @router.callback_query(F.data.startswith("ping:"))
-async def cb_ping(call: CallbackQuery, storage: Storage, cipher: CredCipher):
+async def cb_ping(call: CallbackQuery, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     acc_id = int(call.data.split(":", 1)[1])
     acc = await storage.get_account(acc_id)
     if not acc or acc.tg_user_id != call.from_user.id:
         await call.answer("Не найден", show_alert=True)
         return
     await call.answer("Проверяю…")
-    text = await _check_account(acc, cipher)
+    text = await _check_account(acc, cipher, rotator)
     await call.message.answer(text)
 
 
 @router.callback_query(F.data.startswith("folders:"))
-async def cb_folders(call: CallbackQuery, storage: Storage, cipher: CredCipher):
+async def cb_folders(call: CallbackQuery, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     acc_id = int(call.data.split(":", 1)[1])
     acc = await storage.get_account(acc_id)
     if not acc or acc.tg_user_id != call.from_user.id:
@@ -612,7 +630,8 @@ async def cb_folders(call: CallbackQuery, storage: Storage, cipher: CredCipher):
     password = cipher.decrypt(acc.password_enc)
     try:
         async with imap_client.imap_session(
-            acc.imap_host, acc.imap_port, acc.imap_ssl, acc.email, password
+            acc.imap_host, acc.imap_port, acc.imap_ssl, acc.email, password,
+            proxy=rotator.next_for(acc),
         ) as client:
             folders = await imap_client.list_folders(client)
     except Exception as e:
@@ -637,16 +656,16 @@ async def cb_folders(call: CallbackQuery, storage: Storage, cipher: CredCipher):
 
 
 @router.message(F.text == "📨 Письма")
-async def cmd_mails_active(msg: Message, storage: Storage, cipher: CredCipher):
+async def cmd_mails_active(msg: Message, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     acc = await storage.get_active(msg.from_user.id)
     if not acc:
         await msg.answer("Нет активного ящика. Выбери в 📂 Мои ящики.")
         return
-    await _show_mails(msg, acc, "INBOX", cipher)
+    await _show_mails(msg, acc, "INBOX", cipher, rotator)
 
 
 @router.callback_query(F.data.startswith("mails:"))
-async def cb_mails(call: CallbackQuery, storage: Storage, cipher: CredCipher):
+async def cb_mails(call: CallbackQuery, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
     parts = call.data.split(":", 2)
     if len(parts) < 3:
         await call.answer("Неверный запрос", show_alert=True)
@@ -658,14 +677,15 @@ async def cb_mails(call: CallbackQuery, storage: Storage, cipher: CredCipher):
         await call.answer("Не найден", show_alert=True)
         return
     await call.answer("Загружаю письма…")
-    await _show_mails(call.message, acc, folder, cipher)
+    await _show_mails(call.message, acc, folder, cipher, rotator)
 
 
-async def _show_mails(target: Message, acc: Account, folder: str, cipher: CredCipher) -> None:
+async def _show_mails(target: Message, acc: Account, folder: str, cipher: CredCipher, rotator: ProxyRotator) -> None:
     password = cipher.decrypt(acc.password_enc)
     try:
         async with imap_client.imap_session(
-            acc.imap_host, acc.imap_port, acc.imap_ssl, acc.email, password
+            acc.imap_host, acc.imap_port, acc.imap_ssl, acc.email, password,
+            proxy=rotator.next_for(acc),
         ) as client:
             mails = await imap_client.fetch_recent(client, folder, limit=10)
     except Exception as e:
@@ -683,6 +703,137 @@ async def _show_mails(target: Message, acc: Account, folder: str, cipher: CredCi
             f"   {h(m.date[:40])}\n"
         )
     await target.answer("\n".join(lines))
+
+
+# ----- Proxy management -----
+
+def _proxies_menu_kb(acc_id: int, has_any: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📝 Задать список", callback_data=f"proxyset:{acc_id}")],
+    ]
+    if has_any:
+        rows.append([InlineKeyboardButton(text="🧹 Очистить", callback_data=f"proxyclr:{acc_id}")])
+        rows.append([InlineKeyboardButton(text="🔌 Тест по очереди", callback_data=f"proxytest:{acc_id}")])
+    rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("proxy:"))
+async def cb_proxy_menu(call: CallbackQuery, storage: Storage, rotator: ProxyRotator):
+    acc_id = int(call.data.split(":", 1)[1])
+    acc = await storage.get_account(acc_id)
+    if not acc or acc.tg_user_id != call.from_user.id:
+        await call.answer("Не найден", show_alert=True)
+        return
+    n = rotator.count_for(acc)
+    proxies_list = ""
+    if acc.proxies:
+        try:
+            cfgs = proxymod.parse_list(acc.proxies)
+            proxies_list = "\n\n• " + "\n• ".join(h(c.short) for c in cfgs[:10])
+            if len(cfgs) > 10:
+                proxies_list += f"\n…ещё {len(cfgs) - 10}"
+        except proxymod.ProxyParseError:
+            proxies_list = "\n\n⚠️ строка не парсится"
+    text = (
+        f"<b>🌐 Прокси для {h(acc.label)}</b>\n"
+        f"Сейчас: <b>{n}</b> {'(чередуются по кругу)' if n > 1 else ''}{proxies_list}\n\n"
+        "Поддерживаемые форматы (схема http/https/socks5/socks4 опциональна, по умолчанию http):\n"
+        "<code>login:password@ip:port</code>\n"
+        "<code>ip:port@login:password</code>\n"
+        "<code>login:password:ip:port</code>\n"
+        "<code>ip:port:login:password</code>\n"
+        "<code>socks5://login:pass@1.2.3.4:1080</code>\n\n"
+        "Несколько прокси — по одному на строку (или через запятую/точку с запятой)."
+    )
+    await call.message.answer(text, reply_markup=_proxies_menu_kb(acc_id, bool(acc.proxies)))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("proxyset:"))
+async def cb_proxyset(call: CallbackQuery, state: FSMContext):
+    acc_id = int(call.data.split(":", 1)[1])
+    await state.set_state(ProxyInput.waiting_proxy)
+    await state.update_data(account_id=acc_id)
+    await call.message.answer(
+        "Пришли список прокси одним сообщением (по одному на строку). "
+        "Прежний список заменится. /cancel — отмена."
+    )
+    await call.answer()
+
+
+@router.message(ProxyInput.waiting_proxy)
+async def proxy_input(msg: Message, state: FSMContext, storage: Storage, rotator: ProxyRotator):
+    data = await state.get_data()
+    acc_id = int(data["account_id"])
+    raw = (msg.text or "").strip()
+    if not raw:
+        await msg.answer("Пустой ввод. /cancel чтобы выйти.")
+        return
+    try:
+        cfgs = proxymod.parse_list(raw)
+    except proxymod.ProxyParseError as e:
+        await msg.answer(f"Не распарсилось: {h(str(e))}\nИсправь и пришли заново.")
+        return
+    if not cfgs:
+        await msg.answer("Список пустой.")
+        return
+    await storage.set_proxies(acc_id, raw)
+    rotator.reset(acc_id)
+    await state.clear()
+    preview = "\n• ".join(c.short for c in cfgs[:5])
+    suffix = f"\n…и ещё {len(cfgs) - 5}" if len(cfgs) > 5 else ""
+    await msg.answer(
+        f"Сохранил <b>{len(cfgs)}</b> прокси, будут чередоваться:\n• {h(preview)}{h(suffix)}",
+        reply_markup=main_menu_kb(has_active=True),
+    )
+
+
+@router.callback_query(F.data.startswith("proxyclr:"))
+async def cb_proxyclr(call: CallbackQuery, storage: Storage, rotator: ProxyRotator):
+    acc_id = int(call.data.split(":", 1)[1])
+    acc = await storage.get_account(acc_id)
+    if not acc or acc.tg_user_id != call.from_user.id:
+        await call.answer("Не найден", show_alert=True)
+        return
+    await storage.set_proxies(acc_id, None)
+    rotator.reset(acc_id)
+    await call.answer("Прокси очищены")
+    try:
+        await call.message.edit_text("🌐 Прокси удалены. Соединения пойдут напрямую.")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("proxytest:"))
+async def cb_proxytest(call: CallbackQuery, storage: Storage, cipher: CredCipher):
+    acc_id = int(call.data.split(":", 1)[1])
+    acc = await storage.get_account(acc_id)
+    if not acc or acc.tg_user_id != call.from_user.id:
+        await call.answer("Не найден", show_alert=True)
+        return
+    try:
+        cfgs = proxymod.parse_list(acc.proxies or "")
+    except proxymod.ProxyParseError as e:
+        await call.message.answer(f"Список не парсится: {h(str(e))}")
+        await call.answer()
+        return
+    if not cfgs:
+        await call.answer("Список пуст", show_alert=True)
+        return
+    await call.answer(f"Проверяю {len(cfgs)} прокси…")
+    password = cipher.decrypt(acc.password_enc)
+    results: list[str] = []
+    for i, cfg in enumerate(cfgs, 1):
+        try:
+            ok = await imap_client.check_credentials(
+                acc.imap_host, acc.imap_port, acc.imap_ssl,
+                acc.email, password, proxy=cfg,
+            )
+            results.append(f"{i}. {'✅' if ok else '❌'} {h(cfg.short)}")
+        except Exception as e:
+            results.append(f"{i}. ❌ {h(cfg.short)} — {h(str(e)[:60])}")
+    await call.message.answer("\n".join(results[:30]))
 
 
 # ----- Access management commands -----
@@ -785,8 +936,10 @@ async def main() -> None:
 
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    rotator = ProxyRotator()
     dp["storage"] = storage
     dp["cipher"] = cipher
+    dp["rotator"] = rotator
 
     allowlist_mw = AllowlistMiddleware(storage, settings.admin_ids)
     dp.message.middleware(allowlist_mw)
@@ -794,7 +947,7 @@ async def main() -> None:
 
     dp.include_router(router)
 
-    daemon = FilterDaemon(storage, cipher, settings.filter_interval)
+    daemon = FilterDaemon(storage, cipher, settings.filter_interval, rotator=rotator)
     daemon.start()
 
     try:

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from . import imap_client, sieve_client
 from .crypto import CredCipher
+from .proxy_pool import ProxyRotator
 from .storage import Account, Storage
 
 
@@ -25,17 +26,20 @@ class FilterReport:
 
 
 async def install_or_skip_sieve(
-    account: Account, cipher: CredCipher, keywords: list[str]
+    account: Account, cipher: CredCipher, keywords: list[str],
+    rotator: ProxyRotator | None = None,
 ) -> tuple[str, str | None]:
     """Try to install a Sieve script. Return (mode, error)."""
     if not account.sieve_host or not keywords:
         return ("client", None)
     password = cipher.decrypt(account.password_enc)
+    proxy = rotator.next_for(account) if rotator else None
     try:
         await sieve_client.install_filter(
             account.sieve_host, account.sieve_port,
             account.email, password,
             keywords, account.filter_action,
+            proxy=proxy,
         )
         return ("sieve", None)
     except Exception as e:
@@ -43,28 +47,35 @@ async def install_or_skip_sieve(
         return ("client", str(e))
 
 
-async def remove_sieve_safe(account: Account, cipher: CredCipher) -> None:
+async def remove_sieve_safe(account: Account, cipher: CredCipher,
+                            rotator: ProxyRotator | None = None) -> None:
     if not account.sieve_host:
         return
     password = cipher.decrypt(account.password_enc)
+    proxy = rotator.next_for(account) if rotator else None
     try:
         await sieve_client.remove_filter(
-            account.sieve_host, account.sieve_port, account.email, password
+            account.sieve_host, account.sieve_port, account.email, password,
+            proxy=proxy,
         )
     except Exception as e:
         log.info("Sieve remove failed for %s: %s", account.email, e)
 
 
-async def run_client_filter_once(account: Account, cipher: CredCipher, keywords: list[str]) -> FilterReport:
+async def run_client_filter_once(
+    account: Account, cipher: CredCipher, keywords: list[str],
+    rotator: ProxyRotator | None = None,
+) -> FilterReport:
     """Single pass of client-side filtering on INBOX."""
     if not keywords:
         return FilterReport(mode="client", folders={})
     password = cipher.decrypt(account.password_enc)
+    proxy = rotator.next_for(account) if rotator else None
     affected: dict[str, int] = {}
     try:
         async with imap_client.imap_session(
             account.imap_host, account.imap_port, account.imap_ssl,
-            account.email, password,
+            account.email, password, proxy=proxy,
         ) as client:
             all_uids: set[str] = set()
             for kw in keywords:
@@ -91,10 +102,12 @@ async def run_client_filter_once(account: Account, cipher: CredCipher, keywords:
 class FilterDaemon:
     """Periodic client-side filter runner for accounts where Sieve isn't available."""
 
-    def __init__(self, storage: Storage, cipher: CredCipher, interval: int):
+    def __init__(self, storage: Storage, cipher: CredCipher, interval: int,
+                 rotator: ProxyRotator | None = None):
         self.storage = storage
         self.cipher = cipher
         self.interval = interval
+        self.rotator = rotator
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
@@ -119,7 +132,9 @@ class FilterDaemon:
                     keywords = await self.storage.list_keywords(acc.id)
                     if not keywords:
                         continue
-                    report = await run_client_filter_once(acc, self.cipher, keywords)
+                    report = await run_client_filter_once(
+                        acc, self.cipher, keywords, rotator=self.rotator,
+                    )
                     if report.total:
                         log.info(
                             "Client filter [%s]: %d messages processed", acc.email, report.total

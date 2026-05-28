@@ -1,12 +1,60 @@
 """Thin async IMAP wrapper around aioimaplib for the operations we need."""
 from __future__ import annotations
 
+import asyncio
 import re
 import ssl as ssl_mod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from aioimaplib import aioimaplib
+
+from .proxy import ProxyConfig
+
+
+async def _open_via_proxy(host: str, port: int, ssl_context, proxy: ProxyConfig, timeout: int):
+    """Open a TCP+TLS connection via the given proxy. Returns (transport, sock).
+
+    The socket is wrapped using asyncio's create_connection(sock=...) so the
+    rest of aioimaplib's protocol machinery works unchanged.
+    """
+    from python_socks.async_.asyncio import Proxy as SocksProxy
+
+    proxy_url = proxy.url
+    sp = SocksProxy.from_url(proxy_url)
+    sock = await sp.connect(dest_host=host, dest_port=port, timeout=timeout)
+    sock.setblocking(False)
+    return sock
+
+
+class _ProxiedIMAP4SSL(aioimaplib.IMAP4_SSL):
+    """IMAP4 over SSL routed through an HTTP/SOCKS proxy.
+
+    Overrides create_client to tunnel via python_socks instead of letting
+    aioimaplib open the connection directly.
+    """
+
+    def __init__(self, host, port=993, proxy: ProxyConfig | None = None,
+                 ssl_context=None, timeout=20):
+        self._proxy = proxy
+        super().__init__(host=host, port=port, ssl_context=ssl_context, timeout=timeout)
+
+    def create_client(self, host, port, loop, conn_lost_cb=None, ssl_context=None):
+        if self._proxy is None:
+            return super().create_client(host, port, loop, conn_lost_cb, ssl_context)
+        # Mirror upstream: build protocol now, defer the connect as a task.
+        self.protocol = aioimaplib.IMAP4ClientProtocol(loop, conn_lost_cb)
+
+        async def _connect():
+            sock = await _open_via_proxy(host, port, ssl_context, self._proxy, self.timeout)
+            await loop.create_connection(
+                lambda: self.protocol,
+                sock=sock,
+                ssl=ssl_context,
+                server_hostname=host,
+            )
+
+        loop.create_task(_connect())
 
 
 @dataclass
@@ -25,10 +73,18 @@ def _decode_mailbox_name(raw: str) -> str:
 
 
 @asynccontextmanager
-async def imap_session(host: str, port: int, ssl: bool, user: str, password: str):
-    if ssl:
-        ctx = ssl_mod.create_default_context()
+async def imap_session(
+    host: str, port: int, ssl: bool, user: str, password: str,
+    proxy: ProxyConfig | None = None,
+):
+    ctx = ssl_mod.create_default_context() if ssl else None
+    if proxy is not None and ssl:
+        client = _ProxiedIMAP4SSL(host=host, port=port, proxy=proxy, ssl_context=ctx, timeout=20)
+    elif ssl:
         client = aioimaplib.IMAP4_SSL(host=host, port=port, ssl_context=ctx, timeout=20)
+    elif proxy is not None:
+        # Plain (non-SSL) IMAP through a proxy is uncommon; refuse to keep code simple.
+        raise NotImplementedError("Proxy is only supported for IMAPS (SSL) connections.")
     else:
         client = aioimaplib.IMAP4(host=host, port=port, timeout=20)
     await client.wait_hello_from_server()
@@ -44,9 +100,12 @@ async def imap_session(host: str, port: int, ssl: bool, user: str, password: str
             pass
 
 
-async def check_credentials(host: str, port: int, ssl: bool, user: str, password: str) -> bool:
+async def check_credentials(
+    host: str, port: int, ssl: bool, user: str, password: str,
+    proxy: ProxyConfig | None = None,
+) -> bool:
     try:
-        async with imap_session(host, port, ssl, user, password):
+        async with imap_session(host, port, ssl, user, password, proxy=proxy):
             return True
     except Exception:
         return False
