@@ -806,13 +806,16 @@ async def cb_proxyclr(call: CallbackQuery, storage: Storage, rotator: ProxyRotat
 
 
 async def _test_one_proxy(acc: Account, password: str, cfg) -> tuple[bool, str]:
+    async def _login() -> None:
+        async with imap_client.imap_session(
+            acc.imap_host, acc.imap_port, acc.imap_ssl,
+            acc.email, password, proxy=cfg,
+        ):
+            return None
+
     try:
-        async with asyncio.timeout(25):
-            async with imap_client.imap_session(
-                acc.imap_host, acc.imap_port, acc.imap_ssl,
-                acc.email, password, proxy=cfg,
-            ):
-                return True, ""
+        await asyncio.wait_for(_login(), timeout=25)
+        return True, ""
     except asyncio.TimeoutError:
         return False, "timeout (25s)"
     except PermissionError as e:

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from urllib.parse import quote
 
 
-SUPPORTED_SCHEMES = ("http", "https", "socks5", "socks5h", "socks4")
+SUPPORTED_SCHEMES = ("http", "socks5", "socks5h", "socks4")
 
 
 @dataclass(frozen=True)
@@ -74,8 +74,15 @@ def parse(raw: str, default_scheme: str = "http") -> ProxyConfig:
     if "://" in s:
         scheme, _, s = s.partition("://")
         scheme = scheme.lower()
+        # 'https' looks tempting but python-socks doesn't speak TLS to the
+        # proxy itself. Provider lists like 1.2.3.4:8080 are HTTP CONNECT
+        # proxies (they still tunnel IMAPS just fine); treat https as http.
+        if scheme == "https":
+            scheme = "http"
         if scheme not in SUPPORTED_SCHEMES:
-            raise ProxyParseError(f"unsupported scheme: {scheme}")
+            raise ProxyParseError(
+                f"unsupported scheme: {scheme}. Use one of: {', '.join(SUPPORTED_SCHEMES)}."
+            )
         s = s.strip()
         if not s:
             raise ProxyParseError("missing host after scheme")
