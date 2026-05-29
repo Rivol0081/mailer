@@ -86,6 +86,7 @@ class AllowlistMiddleware(BaseMiddleware):
 class AddAccount(StatesGroup):
     waiting_email = State()
     waiting_password = State()
+    waiting_manual_imap = State()
     waiting_label = State()
 
 
@@ -151,6 +152,18 @@ def confirm_kb(action: str, account_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def _is_cancel(msg: Message) -> bool:
+    return (msg.text or "").strip().lower() in ("/cancel", "отмена", "cancel")
+
+
+async def _do_cancel(msg: Message, state: FSMContext, storage: Storage) -> None:
+    await state.clear()
+    active = await storage.get_active(msg.from_user.id)
+    await msg.answer(
+        "Окей, отменил.", reply_markup=main_menu_kb(has_active=active is not None)
+    )
+
+
 # ---------- Handlers ----------
 
 HELP = (
@@ -204,21 +217,27 @@ async def add_start(msg: Message, state: FSMContext):
 
 
 @router.message(AddAccount.waiting_email)
-async def add_email(msg: Message, state: FSMContext):
+async def add_email(msg: Message, state: FSMContext, storage: Storage):
+    if _is_cancel(msg):
+        await _do_cancel(msg, state, storage)
+        return
     email = (msg.text or "").strip().lower()
     if "@" not in email or " " in email:
-        await msg.answer("Не похоже на email. Попробуй ещё раз.")
+        await msg.answer("Не похоже на email. Попробуй ещё раз. /cancel — отмена.")
         return
     await state.update_data(email=email)
     await state.set_state(AddAccount.waiting_password)
     await msg.answer(
         "Теперь пароль для IMAP (для Gmail/Outlook — application-specific password).\n"
-        "Сообщение с паролем удалю сразу после получения.",
+        "Сообщение с паролем удалю сразу после получения. /cancel — отмена.",
     )
 
 
 @router.message(AddAccount.waiting_password)
 async def add_password(msg: Message, state: FSMContext, storage: Storage, cipher: CredCipher):
+    if _is_cancel(msg):
+        await _do_cancel(msg, state, storage)
+        return
     password = msg.text or ""
     # Best-effort: delete the user's password message from chat history.
     try:
@@ -232,51 +251,105 @@ async def add_password(msg: Message, state: FSMContext, storage: Storage, cipher
     notice = await msg.answer(f"Ищу IMAP-сервер для <code>{h(email)}</code>…")
     info = await autoconfig.discover(email)
     if not info:
+        # Move into manual-entry state instead of leaving the user stuck.
+        await state.update_data(password=password)
+        await state.set_state(AddAccount.waiting_manual_imap)
         await notice.edit_text(
-            f"Не нашёл IMAP-сервер для домена <code>{h(autoconfig.domain_of(email))}</code>. "
-            "Попробуй другой email или задай сервер вручную (этого пока нет в боте — напиши /cancel)."
+            f"Не нашёл IMAP-сервер для домена <code>{h(autoconfig.domain_of(email))}</code>.\n\n"
+            "Введи сервер вручную в формате <code>host</code> или <code>host:port</code>.\n"
+            "Примеры: <code>imap.dransnet.ch</code>, <code>mail.example.com:993</code>.\n"
+            "По умолчанию — порт 993 + SSL. Для STARTTLS на 143 добавь <code>:143:notls</code>.\n"
+            "<code>/cancel</code> — отмена."
         )
         return
 
-    await notice.edit_text(
-        f"Сервер: <code>{h(info.imap_host)}:{info.imap_port}</code>. Проверяю логин…"
+    await _verify_and_advance(
+        notice, state, email, password,
+        info.imap_host, info.imap_port, info.imap_ssl,
+        info.sieve_host, info.sieve_port,
     )
-    ok = await imap_client.check_credentials(
-        info.imap_host, info.imap_port, info.imap_ssl, email, password
+
+
+@router.message(AddAccount.waiting_manual_imap)
+async def add_manual_imap(msg: Message, state: FSMContext, storage: Storage):
+    if _is_cancel(msg):
+        await _do_cancel(msg, state, storage)
+        return
+    raw = (msg.text or "").strip()
+    if not raw:
+        await msg.answer("Пусто, попробуй ещё. /cancel — отмена.")
+        return
+    parts = raw.split(":")
+    host = parts[0].strip()
+    port = 993
+    ssl = True
+    if len(parts) >= 2 and parts[1].strip():
+        try:
+            port = int(parts[1].strip())
+        except ValueError:
+            await msg.answer("Порт должен быть числом. /cancel — отмена.")
+            return
+    if len(parts) >= 3 and parts[2].strip().lower() in ("notls", "starttls", "plain"):
+        ssl = False
+    if not host:
+        await msg.answer("Пустой хост. /cancel — отмена.")
+        return
+
+    data = await state.get_data()
+    email = data["email"]
+    password = data["password"]
+    notice = await msg.answer(f"Подключаюсь к <code>{h(host)}:{port}</code>…")
+    await _verify_and_advance(
+        notice, state, email, password,
+        host, port, ssl,
+        None, 4190,  # No sieve auto-detection for manual entries.
     )
+
+
+async def _verify_and_advance(
+    notice: Message, state: FSMContext,
+    email: str, password: str,
+    imap_host: str, imap_port: int, imap_ssl: bool,
+    sieve_host: str | None, sieve_port: int,
+) -> None:
+    ok = await imap_client.check_credentials(imap_host, imap_port, imap_ssl, email, password)
     if not ok:
         await notice.edit_text(
-            "IMAP-логин не прошёл. Проверь пароль (для Gmail/Outlook нужен app-password) и попробуй снова через ➕."
+            f"IMAP-логин не прошёл на <code>{h(imap_host)}:{imap_port}</code>. "
+            "Проверь сервер/пароль и попробуй снова через ➕ Добавить ящик."
         )
         await state.clear()
         return
 
-    sieve_host = info.sieve_host
-    if sieve_host:
+    real_sieve = sieve_host
+    if real_sieve:
         try:
-            if not await sieve_client.probe(sieve_host, info.sieve_port, email, password):
-                sieve_host = None
+            if not await sieve_client.probe(real_sieve, sieve_port, email, password):
+                real_sieve = None
         except Exception:
-            sieve_host = None
+            real_sieve = None
 
     await state.update_data(
         password=password,
-        imap_host=info.imap_host,
-        imap_port=info.imap_port,
-        imap_ssl=info.imap_ssl,
-        sieve_host=sieve_host,
-        sieve_port=info.sieve_port,
+        imap_host=imap_host,
+        imap_port=imap_port,
+        imap_ssl=imap_ssl,
+        sieve_host=real_sieve,
+        sieve_port=sieve_port,
     )
     await state.set_state(AddAccount.waiting_label)
-    sieve_state = "доступен ✅" if sieve_host else "недоступен — буду фильтровать клиентом"
+    sieve_state = "доступен ✅" if real_sieve else "недоступен — буду фильтровать клиентом"
     await notice.edit_text(
-        f"Логин ок. ManageSieve: {sieve_state}.\n"
-        f"Придумай короткую подпись для вкладки (например, «Личная» или «Работа»):"
+        f"Логин ок ({h(imap_host)}:{imap_port}). ManageSieve: {sieve_state}.\n"
+        "Придумай короткую подпись для вкладки (например, «Личная» или «Работа»):"
     )
 
 
 @router.message(AddAccount.waiting_label)
 async def add_label(msg: Message, state: FSMContext, storage: Storage, cipher: CredCipher):
+    if _is_cancel(msg):
+        await _do_cancel(msg, state, storage)
+        return
     label = (msg.text or "").strip() or "Ящик"
     data = await state.get_data()
     enc = cipher.encrypt(data["password"])
@@ -451,11 +524,14 @@ async def cb_kwadd(call: CallbackQuery, state: FSMContext):
 
 @router.message(KeywordInput.waiting_keyword)
 async def kw_input(msg: Message, state: FSMContext, storage: Storage, cipher: CredCipher, rotator: ProxyRotator):
+    if _is_cancel(msg):
+        await _do_cancel(msg, state, storage)
+        return
     data = await state.get_data()
     acc_id = int(data["account_id"])
     kw = (msg.text or "").strip()
     if not kw:
-        await msg.answer("Пустое слово, попробуй ещё.")
+        await msg.answer("Пустое слово, попробуй ещё. /cancel — отмена.")
         return
     await storage.add_keyword(acc_id, kw)
     await state.clear()
@@ -764,6 +840,9 @@ async def cb_proxyset(call: CallbackQuery, state: FSMContext):
 
 @router.message(ProxyInput.waiting_proxy)
 async def proxy_input(msg: Message, state: FSMContext, storage: Storage, rotator: ProxyRotator):
+    if _is_cancel(msg):
+        await _do_cancel(msg, state, storage)
+        return
     data = await state.get_data()
     acc_id = int(data["account_id"])
     raw = (msg.text or "").strip()
